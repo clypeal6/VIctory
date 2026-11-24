@@ -181,7 +181,19 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // The default adapter is the one driving the primary display, on a
+            // hybrid laptop usually the integrated GPU: ask for the fast one.
+            let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let adapter: IDXGIAdapter1 =
+                factory.EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)?;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            let desc = adapter.GetDesc1()?;
+            let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            tracing::info!(
+                adapter = String::from_utf16_lossy(&desc.Description[..len]),
+                vendor = format_args!("{:#x}", desc.VendorId),
+                "host device on the hardware adapter"
+            );
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
