@@ -497,13 +497,25 @@ impl HostPipeline {
         };
         let state = g.describe();
         if mesh.is_some() {
+            // WARP reads a null pointer clipping the triangles of a mesh
+            // pipeline without a pixel shader (CHWClipper::ClipTriangle):
+            // there it gets one that writes nothing, which draws the same.
+            let empty = (code(1).BytecodeLength == 0 && victory_shader::emit::software_host())
+                .then(victory_shader::emit::host::empty_ps);
+            let ps = empty.as_ref().map_or_else(
+                || code(1),
+                |s| D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: s.dxil.as_ptr().cast(),
+                    BytecodeLength: s.dxil.len(),
+                },
+            );
             let name = super::library::name(
                 "mesh",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[&code_bytes(&code(0)), &code_bytes(&ps)],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
+            let pso = match mesh_pipeline(&host.device, &root, code(0), ps, g, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");

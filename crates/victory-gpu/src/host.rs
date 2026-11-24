@@ -182,7 +182,19 @@ fn create() -> windows::core::Result<Host> {
             victory_shader::emit::set_software_host();
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // The default adapter is the one driving the primary display, on a
+            // hybrid laptop usually the integrated GPU: ask for the fast one.
+            let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let adapter: IDXGIAdapter1 =
+                factory.EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)?;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            let desc = adapter.GetDesc1()?;
+            let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            tracing::info!(
+                adapter = String::from_utf16_lossy(&desc.Description[..len]),
+                vendor = format_args!("{:#x}", desc.VendorId),
+                "host device on the hardware adapter"
+            );
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
@@ -568,6 +580,10 @@ impl Host {
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
+            // WARP starts on the lists as they are submitted.
+            #[cfg(feature = "diagnostics")]
+            let _waiting =
+                warp_fault::Waiting::new(if groups.len() > 1 { &runs[i..=i] } else { runs });
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
@@ -1977,6 +1993,89 @@ fn wait_reporting(event: HANDLE, runs: &[&HostList]) {
         report_progress(runs, reports == 1);
     }
     let _ = reports;
+}
+
+/// Diagnostics: WARP runs a submission on its own threads while ours waits
+/// in [`wait_reporting`]; a fault inside WARP (a null read in its mesh
+/// clipper) ends the process before any report. A vectored handler prints
+/// the waiting submission's progress first.
+#[cfg(feature = "diagnostics")]
+mod warp_fault {
+    use super::{report_progress, HostList};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        AddVectoredExceptionHandler, EXCEPTION_POINTERS,
+    };
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetModuleHandleExW, GetModuleHandleW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    };
+
+    /// The waiting submission's `&[&HostList]`: pointer and length.
+    static RUNS: (AtomicUsize, AtomicUsize) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+
+    /// Names the submission waited on while it lives.
+    pub(super) struct Waiting;
+
+    impl Waiting {
+        pub(super) fn new(runs: &[&HostList]) -> Self {
+            static INSTALLED: std::sync::Once = std::sync::Once::new();
+            // SAFETY: a handler that only reads what `RUNS` names.
+            INSTALLED.call_once(|| unsafe {
+                AddVectoredExceptionHandler(0, Some(handler));
+            });
+            RUNS.1.store(runs.len(), Ordering::Release);
+            RUNS.0.store(runs.as_ptr() as usize, Ordering::Release);
+            Waiting
+        }
+    }
+
+    impl Drop for Waiting {
+        fn drop(&mut self) {
+            RUNS.0.store(0, Ordering::Release);
+        }
+    }
+
+    unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+        const CONTINUE_SEARCH: i32 = 0;
+        // SAFETY: the system passes a live record.
+        let record = unsafe { &*(*info).ExceptionRecord };
+        if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION {
+            return CONTINUE_SEARCH;
+        }
+        let mut module = std::ptr::null_mut();
+        // SAFETY: plain module queries.
+        let in_warp = unsafe {
+            let warp = GetModuleHandleW(windows_sys::w!("d3d10warp.dll"));
+            !warp.is_null()
+                && GetModuleHandleExW(
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                        | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    record.ExceptionAddress as *const u16,
+                    &mut module,
+                ) != 0
+                && module == warp
+        };
+        let runs = RUNS.0.load(Ordering::Acquire);
+        if in_warp && runs == 0 && !REPORTED.swap(true, Ordering::AcqRel) {
+            tracing::error!("WARP faulted with no submission running");
+        }
+        if in_warp && runs != 0 && !REPORTED.swap(true, Ordering::AcqRel) {
+            tracing::error!(
+                at = format_args!("{:#x}", record.ExceptionAddress as usize - module as usize),
+                "WARP faulted while running this submission"
+            );
+            // SAFETY: the waiting thread keeps the lists alive until it
+            // clears `RUNS`, and it is blocked on this submission.
+            let runs = unsafe {
+                std::slice::from_raw_parts(runs as *const &HostList, RUNS.1.load(Ordering::Acquire))
+            };
+            report_progress(runs, true);
+        }
+        CONTINUE_SEARCH
+    }
 }
 
 /// Where each list is by its GPU progress markers, and with `detail` the

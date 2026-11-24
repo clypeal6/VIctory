@@ -531,6 +531,12 @@ pub fn stub_ps() -> HostShader {
     stub(true, vec![target])
 }
 
+/// A pixel shader that reads and writes nothing (see
+/// `victory_gpu`'s mesh pipelines on WARP).
+pub fn empty_ps() -> HostShader {
+    stub(true, Vec::new())
+}
+
 fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
     use super::bitcode::{Attr, Term};
     let mut s = super::shader::Shader::new(pixel);
@@ -1518,6 +1524,23 @@ mod tests {
 /// (WARP compiles Grand Theft Auto VI's 42683eebec081520 in 20 ms so, not in
 /// minutes with the counters). Bindings are dummies:
 /// only the compile time is measured.
+/// Investigation: draws one clipped mesh-shader triangle on WARP from
+/// compiled `VICTORY_CLIP_MS` and `VICTORY_CLIP_PS` (embedded root
+/// signatures), to see which mesh pipelines WARP's clipper survives.
+#[cfg(test)]
+#[test]
+#[ignore]
+fn warp_clip_mesh() {
+    let read = |k: &str| std::fs::read(std::env::var(k).expect(k)).expect(k);
+    let (ms, ps) = (read("VICTORY_CLIP_MS"), read("VICTORY_CLIP_PS"));
+    let host = Host::new(true).expect("WARP");
+    // SAFETY: a root signature blob inside a live container.
+    let root: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, &ms) }.expect("root");
+    let pso = host.mesh_pipeline_with(&root, &ms, &ps).expect("pipeline");
+    let d = Draw { roots: vec![], textures: &[], samplers: &[], vertices: &[], stride: 0, size: (4, 4), mesh_groups: 1 };
+    println!("drawn: {:?}", host.draw(&root, &pso, &d).map(|_| ()));
+}
+
 #[cfg(test)]
 #[test]
 #[ignore]

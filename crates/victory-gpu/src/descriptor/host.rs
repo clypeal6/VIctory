@@ -459,6 +459,10 @@ impl HostHeap {
             #[cfg(feature = "diagnostics")]
             if let Some(s) = crate::shadow::find(address, len.max(1)) {
                 let n = (len / 4).min(4) as usize;
+                // The title may have decommitted a range the host copy still describes.
+                if !crate::texture::committed(address as *const u8, n * 4) {
+                    return Some(text + " title memory not committed");
+                }
                 // SAFETY: inside a buffer the title placed (GPU addresses are CPU addresses).
                 let words: Vec<u32> = (0..n)
                     .map(|i| unsafe { (address as *const u32).add(i).read_unaligned() })

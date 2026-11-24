@@ -1260,6 +1260,18 @@ fn describe(view: Option<&View>) -> String {
             format!("{}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
         })
     };
+    // The view description too: a shader declaring another kind of view
+    // than the slot holds is undefined (WARP may remove the device).
+    let desc = match view {
+        Some(View::Shader(_, d) | View::Unordered(_, _, d)) => format!(" view {d:?}"),
+        Some(View::Placed(_, _, d)) => format!(" view {:?}", &d[..10]),
+        _ => String::new(),
+    };
+    desc_of(view, texture) + &desc
+}
+
+#[cfg(feature = "diagnostics")]
+fn desc_of(view: Option<&View>, texture: impl Fn(This) -> Option<String>) -> String {
     match view {
         None => "no view".into(),
         Some(v @ View::Shader(r, _)) => texture(*r as This)

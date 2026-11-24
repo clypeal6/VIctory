@@ -7691,6 +7691,22 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        // WARP removes the device (or faults in its clipper) clipping a
+        // triangle with an infinite position. A NaN position discards the
+        // triangle instead, as hardware drops such a primitive.
+        let infinite = if e.target == Target::Position(0) && super::software_host() {
+            let (c, magnitude, inf) = (self.cur, self.s.m.i32(0x7FFF_FFFF), self.s.m.i32(0x7F80_0000));
+            let mut any = self.s.m.bool(false);
+            for &(_, _, value, _) in &stores {
+                let x = self.i32_of(value)?;
+                let m = self.s.m.bin(c, Bin::And, x, magnitude);
+                let is = self.s.m.cmp(c, pred::EQ, m, inf);
+                any = self.s.m.bin(c, Bin::Or, any, is);
+            }
+            Some(any)
+        } else {
+            None
+        };
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
@@ -7718,6 +7734,13 @@ impl<'a> Lower<'a> {
                     (".f32", f)
                 }
                 _ => (".i32", x),
+            };
+            let x = match infinite {
+                Some(any) if suffix == ".f32" => {
+                    let nan = self.s.m.f32(0x7FC0_0000);
+                    self.s.m.select(self.cur, any, nan, x)
+                }
+                _ => x,
             };
             let mut args = vec![
                 self.s.m.i32(id as u32),
