@@ -16,15 +16,27 @@ use crate::{io, ir, resource, structure};
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
 /// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
 fn build(words: &[u32], buffers: bool) -> HostShader {
-    let table = |user_data: u8| RootParam {
-        root: RootType::Table,
-        table_offset_dwords: 0,
-        sgprs: 1,
-        base_register: 0,
-        user_data,
-        slot: user_data,
+    let views = if buffers {
+        range(ResourceType::Srv, 0, 4, 4, 0)
+    } else {
+        range(ResourceType::Srv, 0, 8, 0, 0)
     };
-    let range = |kind, table_offset_dwords, dwords, stride, user_data| UsedResource {
+    let (shader, nonuniform_handles, wave_ops) = lower_cs(words, views);
+    // One access with each lane's own heap index, no wave operation.
+    assert_eq!(nonuniform_handles, 1);
+    assert!(!wave_ops);
+    shader
+}
+
+/// A view range of the table at `user_data`.
+fn range(
+    kind: ResourceType,
+    table_offset_dwords: u32,
+    dwords: u8,
+    stride: u32,
+    user_data: u8,
+) -> UsedResource {
+    UsedResource {
         kind,
         root: RootType::Table,
         table_offset_dwords,
@@ -33,11 +45,20 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         dwords,
         user_data,
         slot: user_data,
-    };
-    let views = if buffers {
-        range(ResourceType::Srv, 0, 4, 4, 0)
-    } else {
-        range(ResourceType::Srv, 0, 8, 0, 0)
+    }
+}
+
+/// [`build`]'s program with `views` as the table's first range, lowered and
+/// validated; also its count of non-uniform handles and whether it uses
+/// wave operations.
+fn lower_cs(words: &[u32], views: UsedResource) -> (HostShader, u32, bool) {
+    let table = |user_data: u8| RootParam {
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data,
+        slot: user_data,
     };
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -71,9 +92,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         mesh_stride: 0,
     })
     .expect("lower");
-    // One access with each lane's own heap index, no wave operation.
-    assert_eq!(lowered.nonuniform_handles, 1);
-    assert!(!lowered.wave_ops);
+    let (nonuniform_handles, wave_ops) = (lowered.nonuniform_handles, lowered.wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -89,7 +108,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     } else {
         eprintln!("no dxil.dll; validation skipped");
     }
-    shader
+    (shader, nonuniform_handles, wave_ops)
 }
 
 /// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
@@ -245,5 +264,45 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         for (label, red) in results {
             assert_eq!(red, want, "{label}, folded {folded}");
         }
+    }
+}
+
+/// A scalar load from a structured buffer (a 16-byte element, as the title
+/// views it) reads every dword of the element. Read through a raw view it is
+/// undefined, and NVIDIA returned zeros past the first dword (GTA VI's
+/// compute 42683eebec081520 then divided its loop bounds by zero).
+#[test]
+fn a_scalar_load_reads_a_structured_buffer_element_whole() {
+    let words = [
+        0xBE81_0380, // s_mov_b32 s1, 0
+        0xF408_0100,
+        0xFA00_0000, // s_load_dwordx4 s[4:7], s[0:1], 0
+        0xF408_0200,
+        0xFA00_0040, // s_load_dwordx4 s[8:11], s[0:1], 0x40
+        0xF428_0302,
+        0xFA00_0000, // s_buffer_load_dwordx4 s[12:15], s[4:7], 0
+        0x7E02_020F, // v_mov_b32 v1, s15
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xE070_1000,
+        0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let (shader, _, _) = lower_cs(&words, range(ResourceType::Srv, 0, 4, 16, 0));
+    let element = [1024, 512, 2560, 1440];
+    let views = [
+        View::Buffer {
+            data: &element,
+            stride: Stride::Structured(16),
+        },
+        View::Buffer {
+            data: &element,
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(32),
+    ];
+    let results = run(&shader, &views);
+    assert!(!results.is_empty());
+    for (label, got) in results {
+        assert_eq!(got, vec![1440; 32], "{label}");
     }
 }

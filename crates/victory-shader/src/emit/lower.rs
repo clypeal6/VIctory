@@ -2850,20 +2850,20 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        if let Some(used) = kind.filter(|u| u.kind == ResourceType::Srv) {
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
+                let (h, index, within) = self.byte_access(site, src, Some(used), 0, a)?;
                 let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+                let al = self.s.m.i32(4);
                 let r = self.s.op(
                     c,
                     "rawBufferLoad.f32",
                     Attr::ReadOnly,
                     self.s.t.res_ret,
                     139,
-                    &[h, a, u, mask, al],
+                    &[h, index, within, mask, al],
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
@@ -3259,6 +3259,39 @@ impl<'a> Lower<'a> {
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
+    /// A handle for buffer `src` accessed at byte `off` without an index,
+    /// and the coordinates there. The title views a structured buffer as
+    /// structured, and a raw access to such a view is undefined: NVIDIA reads
+    /// past its first dwords as zeros (GTA VI's 42683eebec081520 then divides
+    /// its loop bounds by zero and loops four billion times). So a buffer its
+    /// program declares with a stride above 4 bytes is accessed as structured
+    /// (one access of the console compiler's stays inside an element).
+    fn byte_access(
+        &mut self,
+        site: Site,
+        src: &Source,
+        used: Option<&UsedResource>,
+        uav: u32,
+        off: V,
+    ) -> Result<(V, V, V), Why> {
+        let c = self.cur;
+        match used
+            .map(|u| u.stride)
+            .filter(|&s| s > 4 && s.is_multiple_of(4))
+        {
+            Some(s) => {
+                let h = self.handle(site, src, false, (12 | uav, s))?;
+                let s = self.s.m.i32(s);
+                let index = self.s.m.bin(c, Bin::UDiv, off, s);
+                Ok((h, index, self.s.m.bin(c, Bin::URem, off, s)))
+            }
+            None => {
+                let h = self.handle(site, src, false, (11 | uav, 0))?;
+                Ok((h, off, self.s.m.undef(self.s.t.i32)))
+            }
+        }
+    }
+
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
             src
@@ -6284,7 +6317,10 @@ impl<'a> Lower<'a> {
                     let h = self.handle(site, src, false, (12 | u, stride))?;
                     (h, [index, off, iu])
                 }
-                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+                None => {
+                    let (h, i, w) = self.byte_access(site, src, used, u, off)?;
+                    (h, [i, w, iu])
+                }
             };
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
@@ -6368,8 +6404,8 @@ impl<'a> Lower<'a> {
                         args.extend([index, off]);
                     }
                     None => {
-                        args.push(self.handle(site, src, false, (11 | u, 0))?);
-                        args.extend([off, iu]);
+                        let (h, i, w) = self.byte_access(site, src, used, u, off)?;
+                        args.extend([h, i, w]);
                     }
                 }
                 args.extend(&vals);
@@ -6436,14 +6472,14 @@ impl<'a> Lower<'a> {
                     )
                 }
                 None => {
-                    let h = self.handle(site, src, false, (11 | u, 0))?;
+                    let (h, i, w) = self.byte_access(site, src, used, u, off)?;
                     self.s.op(
                         c,
                         "rawBufferLoad.f32",
                         Attr::ReadOnly,
                         self.s.t.res_ret,
                         139,
-                        &[h, off, iu, mask, align],
+                        &[h, i, w, mask, align],
                     )
                 }
             }
