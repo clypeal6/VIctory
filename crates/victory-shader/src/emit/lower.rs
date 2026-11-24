@@ -5548,7 +5548,12 @@ impl<'a> Lower<'a> {
                     Some(o) => self.i32_of(o)?,
                     None => self.s.m.i32(0),
                 };
-                self.s.flags |= flags::WAVE_OPS;
+                // Emulated wave64 lanes come from the thread index, no wave op.
+                if self.emulating_wave64() {
+                    self.cross_lane(false)?;
+                } else {
+                    self.s.flags |= flags::WAVE_OPS;
+                }
                 let me = self.lane_index();
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
