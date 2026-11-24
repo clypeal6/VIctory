@@ -219,10 +219,23 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
-/// The console's mode list: one 4K mode at 60 Hz (Grand Theft Auto VI looks
-/// for a 120 Hz one to allow 120 Hz frame intervals).
-/// shortcut: fixed mode, not the host display's; report the host's rates if
-/// a title paces by them.
+fn desktop_size() -> (u32, u32) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
+        let mut display = DEVMODEW { dmSize: size_of::<DEVMODEW>() as u16, ..Default::default() };
+        // SAFETY: the null device selects the default display; the buffer has its declared size.
+        if unsafe { EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, &mut display) }.as_bool()
+            && display.dmPelsWidth > 0 && display.dmPelsHeight > 0
+        {
+            return (display.dmPelsWidth, display.dmPelsHeight);
+        }
+    }
+    (3840, 2160)
+}
+
+/// One progressive mode at the desktop's physical pixel dimensions.
+/// shortcut: fixed 60 Hz, report the host rates if a title needs other frame intervals.
 extern "system" fn modes(
     _: This,
     _format: u32,
@@ -242,9 +255,10 @@ extern "system" fn modes(
         return MORE_DATA;
     }
     *count = 1;
+    let (width, height) = desktop_size();
     let mode = Mode {
-        width: 3840,
-        height: 2160,
+        width,
+        height,
         refresh: [60, 1],
         format: 0,
         scanlines: 1, // progressive
@@ -274,6 +288,20 @@ mod tests {
     type Get = extern "system" fn(This, *mut This) -> HRESULT;
     type Indexed = extern "system" fn(This, u32, *mut This) -> HRESULT;
     type Describe = extern "system" fn(This, *mut AdapterDescription) -> HRESULT;
+
+    #[test]
+    fn output_mode_reports_desktop_dimensions() {
+        let output = std::ptr::null_mut();
+        let mut count = 0;
+        assert_eq!(modes(output, 0, 0, &mut count, std::ptr::null_mut()), S_OK);
+        assert_eq!(count, 1);
+        let mut mode = std::mem::MaybeUninit::uninit();
+        assert_eq!(modes(output, 0, 0, &mut count, mode.as_mut_ptr()), S_OK);
+        // SAFETY: the successful query above initialized the mode.
+        let mode = unsafe { mode.assume_init() };
+        assert_eq!((mode.width, mode.height), desktop_size());
+        assert_eq!(mode.refresh, [60, 1]);
+    }
 
     /// Minecraft's startup: device → DXGI device (newest first) → adapter →
     /// description, factory, first output.

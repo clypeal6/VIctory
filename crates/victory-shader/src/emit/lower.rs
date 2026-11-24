@@ -81,6 +81,20 @@ const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
 
+/// Largest guest base byte address for a dword access with this instruction offset.
+pub(super) fn last_lds_base(dwords: u32, offset: u32) -> Option<u32> {
+    dwords.checked_mul(4)?.checked_sub(4)?.checked_sub(offset)
+}
+
+/// For a power-of-two vertex count, check all three 10-bit indices and the
+/// guest cull flag with one packed mask.
+fn triangle_cull_mask(vertices: u32) -> Option<u32> {
+    vertices.is_power_of_two().then(|| {
+        let high = 0x3ff & !(vertices - 1);
+        (1 << 31) | high | (high << 10) | (high << 20)
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Numeric {
     Unorm,
@@ -184,23 +198,23 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
-    /// Wave64 compute lowering mode (`Native` when not a Wave64 compute shader).
+    /// Compute wave lowering mode. Other shader stages use the native path.
     wave64: Wave64Mode,
     /// Compute thread count per group (0 outside compute).
     total_threads: u32,
     /// LDS dwords declared by the title itself (excluding emulation scratch).
     title_lds_dwords: u32,
-    /// Virtual 64-lane waves per thread group (`total_threads.div_ceil(64)`).
+    /// Number of virtual guest waves in one thread group.
     virtual_waves: u32,
     /// Base dword index of the ballot / firstlane LDS scratch region.
     ballot_base: u32,
     /// Scratch dwords per virtual wave in `ballot_base` (`2` or `4`).
     ballot_stride: u32,
-    /// Base dword index of the per-lane LDS exchange region (`64 * virtual_waves`).
+    /// Base dword index of the LDS exchange region, one dword per virtual lane.
     exchange_base: u32,
     /// Emulation scratch pushed total LDS past D3D12's 32 KiB (8192 dword) limit.
     lds_overflow: bool,
-    /// Barrier-less `<= 64`-thread Wave64 compute shader sharing LDS across host waves.
+    /// Guest-local memory operations require explicit host group synchronization.
     need_lds_barriers: bool,
     /// Pre-resolved constant-lane `v_readlane_b32` SGPR spills by site.
     spills: HashMap<(usize, usize), Moved>,
@@ -772,7 +786,8 @@ impl<'a> Lower<'a> {
                 })
             };
 
-            let req_mode = if x.native.wave64 {
+            let wave = if x.native.wave64 { 64u32 } else { 32 };
+            let req_mode = if x.native.wave64 || x.options.wave64 == Wave64Mode::Emulate {
                 x.options.wave64
             } else {
                 Wave64Mode::Native
@@ -788,7 +803,6 @@ impl<'a> Lower<'a> {
 
             match req_mode {
                 Wave64Mode::Native => {
-                    let wave = if x.native.wave64 { 64 } else { 32 };
                     let one_wave = total_threads <= wave;
                     if console_lanes || one_wave && title_lds_dwords > 0 {
                         s.wave_size = Some(wave);
@@ -848,14 +862,15 @@ impl<'a> Lower<'a> {
                         // Wave64Mode::Emulate (`s.wave_size = None`).
                         if need_emu {
                             wave64 = Wave64Mode::Emulate;
-                            virtual_waves = total_threads.div_ceil(64);
+                            virtual_waves = total_threads.div_ceil(wave);
+                            // Ballots and read-first share the two-word scratch record.
                             ballot_stride = 2;
                             let ballot_dwords = 2 * virtual_waves;
                             let exchange_dwords = if !sections.is_empty()
                                 || has_unresolved_readlane
                                 || has_swizzle_or_dpp
                             {
-                                64 * virtual_waves
+                                wave * virtual_waves
                             } else {
                                 0
                             };
@@ -866,8 +881,8 @@ impl<'a> Lower<'a> {
                             lds_overflow = emu_dwords > 0 && s.lds_dwords > 8192;
                             cross_block_masks = collect_cross_block_masks(p, x.st, &def_block);
                         }
-                        if total_threads > 1 && total_threads <= 64 && has_lds_mem && !has_s_barrier
-                        {
+                        if total_threads > 1 && has_lds_mem
+                            && (!x.native.wave64 || (total_threads <= wave && !has_s_barrier)) {
                             need_lds_barriers = true;
                         }
                     }
@@ -1144,7 +1159,7 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Whether this shader emulates 64-lane waves across multiple host waves or arbitrary width.
+    /// Whether a guest wave spans multiple host waves.
     fn emulating_wave64(&self) -> bool {
         self.wave64 == Wave64Mode::Emulate
             || (self.wave64 == Wave64Mode::Wave32 && self.total_threads > 32)
@@ -1194,10 +1209,11 @@ impl<'a> Lower<'a> {
             self.s.flags |= flags::WAVE_OPS;
             self.s.m.bin(e, Bin::Add, base, lane)
         };
-        let k63 = self.s.m.i32(63);
-        let k6 = self.s.m.i32(6);
-        let console_lane = self.s.m.bin(e, Bin::And, flat, k63);
-        let vwave = self.s.m.bin(e, Bin::LShr, flat, k6);
+        let width = self.wave();
+        let lane_mask = self.s.m.i32(width - 1);
+        let wave_shift = self.s.m.i32(width.ilog2());
+        let console_lane = self.s.m.bin(e, Bin::And, flat, lane_mask);
+        let vwave = self.s.m.bin(e, Bin::LShr, flat, wave_shift);
         let ids = (flat, console_lane, vwave);
         self.wave_ids = Some(ids);
         ids
@@ -1217,11 +1233,11 @@ impl<'a> Lower<'a> {
         self.s.m.element(block, lds, idx)
     }
 
-    /// Pointer to LDS exchange dword `exchange_base + vwave * 64 + lane_offset`.
+    /// Pointer to one lane of an emulated wave's exchange area.
     fn exchange_ptr(&mut self, block: usize, vwave: V, lane_offset: V) -> V {
         let base_v = self.s.m.i32(self.exchange_base);
-        let k64 = self.s.m.i32(64);
-        let wave_off = self.s.m.bin(block, Bin::Mul, vwave, k64);
+        let width = self.s.m.i32(self.wave());
+        let wave_off = self.s.m.bin(block, Bin::Mul, vwave, width);
         let row = self.s.m.bin(block, Bin::Add, base_v, wave_off);
         let idx = self.s.m.bin(block, Bin::Add, row, lane_offset);
         let lds = self.s.lds();
@@ -1319,15 +1335,26 @@ impl<'a> Lower<'a> {
         if self.guard_depth > 0 || !self.uniform.get(self.cur_ir).copied().unwrap_or(false) {
             return Err("a cross-lane read in divergent control flow");
         }
-        let (_, console_lane, vwave) = self.ensure_wave_ids();
+        let (flat, console_lane, vwave) = self.ensure_wave_ids();
         self.lds_barrier(self.cur);
         let wptr = self.exchange_ptr(self.cur, vwave, console_lane);
         self.s.m.store(self.cur, wptr, val);
         self.lds_barrier(self.cur);
-        let k63 = self.s.m.i32(63);
-        let idx = self.s.m.bin(self.cur, Bin::And, lane, k63);
+        let lane_mask = self.s.m.i32(self.wave() - 1);
+        let idx = self.s.m.bin(self.cur, Bin::And, lane, lane_mask);
+        let live = if self.total_threads.is_multiple_of(self.wave()) {
+            None
+        } else {
+            let start = self.s.m.bin(self.cur, Bin::Sub, flat, console_lane);
+            let source = self.s.m.bin(self.cur, Bin::Add, start, idx);
+            let end = self.s.m.i32(self.total_threads);
+            Some(self.s.m.cmp(self.cur, pred::IULT, source, end))
+        };
+        let at = self.begin_guarded(live);
         let rptr = self.exchange_ptr(self.cur, vwave, idx);
-        Ok(self.s.m.load(self.cur, rptr))
+        let x = self.s.m.load(self.cur, rptr);
+        let zero = self.s.m.i32(0);
+        Ok(self.end_guarded(at, &[(x, zero)])[0])
     }
 
     /// Emulates `v_readfirstlane_b32(val)` across all 64 lanes of a virtual wave.
@@ -1622,13 +1649,14 @@ impl<'a> Lower<'a> {
                 return Err("a wave reduction in divergent control flow");
             }
             let (_, console_lane, vwave) = self.ensure_wave_ids();
-            let max_in_vwave = self.total_threads.min(64);
+            let width = self.wave();
+            let max_in_vwave = self.total_threads.min(width);
             if let Some(inclusive) = prefix {
                 if !matches!(op, Op::AddU | Op::AddF) {
                     return Err("a wave prefix of an operation other than a sum");
                 }
                 let mut cur_val = x;
-                for shift in 0..6 {
+                for shift in 0..width.ilog2() {
                     let stride = 1u32 << shift;
                     if stride >= max_in_vwave {
                         break;
@@ -1665,10 +1693,10 @@ impl<'a> Lower<'a> {
                 self.lds_barrier(self.cur);
                 let wp = self.exchange_ptr(self.cur, vwave, console_lane);
                 self.s.m.store(self.cur, wp, x);
-                let partial = !self.total_threads.is_multiple_of(64);
+                let partial = !self.total_threads.is_multiple_of(width);
                 let (flat, _, _) = self.ensure_wave_ids();
                 let total_v = self.s.m.i32(self.total_threads);
-                for shift in (0..6).rev() {
+                for shift in (0..width.ilog2()).rev() {
                     let stride = 1u32 << shift;
                     if stride >= max_in_vwave {
                         continue;
@@ -1811,13 +1839,21 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
-        // Loop headers count iterations (`LOOP_LIMIT`).
+        // Loop headers count iterations (`LOOP_LIMIT`), except with a limit of
+        // u32::MAX (diagnostics) and, on the software adapter, in compute
+        // programs that synchronize their group (`super::set_software_host`).
+        let synchronizes = self.s.threads.is_some()
+            && self.s.mesh.is_none()
+            && (self.need_lds_barriers
+                || self.emulating_wave64()
+                || p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_barrier"));
+        let counted = super::loop_limit() != u32::MAX && !(synchronizes && super::software_host());
         for &b in &order {
             let header = p.blocks[b]
                 .preds
                 .iter()
                 .any(|&q| self.block[q].is_some() && self.rpo[b] <= self.rpo[q]);
-            if header {
+            if header && counted {
                 let blk = self.block[b].expect("reachable");
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
@@ -2912,7 +2948,7 @@ impl<'a> Lower<'a> {
     /// Mesh: the counts and the primitives no lane exports. The console's
     /// counts come from one lane's allocation request, which DXIL cannot
     /// express (one call, dominating every output write).
-    // shortcut: the counts are the declared maxima and each lane first culls
+    // shortcut: the counts are the reachable maxima and each lane first culls
     // its primitive (all indices 0, zero area), so primitives past the
     // program's count are culled and vertices past it unused; this costs
     // the host the unused vertex and primitive slots. Pass the program's own
@@ -2922,19 +2958,20 @@ impl<'a> Lower<'a> {
         if mesh.topology != 2 {
             return Err("a mesh shader not drawing triangles");
         }
-        if threads > 128 || mesh.max_vertices > 256 || mesh.max_primitives > 256 {
+        if threads == 0 || threads > 128 || mesh.max_vertices > 256 || mesh.max_primitives > 256 {
             return Err("a mesh shader beyond the host's limits");
         }
         let e = self.s.entry;
         let void = self.s.t.void;
-        let (v, p) = (
-            self.s.m.i32(mesh.max_vertices),
-            self.s.m.i32(mesh.max_primitives),
-        );
+        let (vertices, primitives) = mesh.output_counts(threads);
+        let (v, p) = (self.s.m.i32(vertices), self.s.m.i32(primitives));
         self.s
             .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
+        if primitives == 0 {
+            return Ok(());
+        }
         let flat = self.mesh_thread();
-        let guard = (threads > mesh.max_primitives).then(|| self.s.m.cmp(e, pred::IULT, flat, p));
+        let guard = self.mesh_output_guard(None, primitives);
         let at = self.begin_guarded(guard);
         let z = self.s.m.i32(0);
         self.s.op(
@@ -2947,6 +2984,19 @@ impl<'a> Lower<'a> {
         );
         self.end_guarded(at, &[]);
         Ok(())
+    }
+
+    fn mesh_output_guard(&mut self, guard: Option<V>, count: u32) -> Option<V> {
+        if self.s.threads.expect("mesh")[0] <= count {
+            return guard;
+        }
+        let flat = self.mesh_thread();
+        let limit = self.s.m.i32(count);
+        let fits = self.s.m.cmp(self.cur, pred::IULT, flat, limit);
+        Some(match guard {
+            Some(active) => self.s.m.bin(self.cur, Bin::And, active, fits),
+            None => fits,
+        })
     }
 
     /// Mesh: the thread's index in the group, which is its vertex and
@@ -3130,23 +3180,36 @@ impl<'a> Lower<'a> {
         if self.title_lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
-        if self.need_lds_barriers
-            && self.guard_depth == 0
-            && self.uniform.get(b).copied().unwrap_or(false)
-        {
-            self.lds_barrier(self.cur);
+        if self.need_lds_barriers {
+            if self.guard_depth == 0 && self.uniform.get(b).copied().unwrap_or(false) {
+                self.lds_barrier(self.cur);
+            } else if self.x.options.wave64 == Wave64Mode::Emulate {
+                return Err("a shared-memory access in divergent emulated control flow");
+            }
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as dword-aligned and in bounds
-        // (out-of-bounds console accesses read 0 and drop writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        let dword = |l: &mut Self, bytes: u32| -> (V, Option<V>) {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
-            let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let mut index = l.s.m.bin(c, Bin::LShr, at, two);
+            let mut valid = None;
+            // Appended emulation scratch is invisible to guest LDS instructions.
+            if l.x.options.wave64 == Wave64Mode::Emulate && l.s.mesh.is_none() {
+                let fits = match last_lds_base(l.title_lds_dwords, bytes) {
+                    Some(last) => {
+                        let last = l.s.m.i32(last);
+                        l.s.m.cmp(c, pred::IULE, a, last)
+                    }
+                    None => l.s.m.bool(false),
+                };
+                let zero = l.s.m.i32(0);
+                index = l.s.m.select(c, fits, index, zero);
+                valid = Some(fits);
+            }
             let lds = l.s.lds();
-            l.s.m.element(c, lds, index)
+            (l.s.m.element(c, lds, index), valid)
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -3176,8 +3239,11 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let p = dword(self, off + 4 * k);
+                    let (p, valid) = dword(self, off + 4 * k);
+                    let at = self.begin_guarded(valid);
                     let x = self.s.m.load(self.cur, p);
+                    let zero = self.s.m.i32(0);
+                    let x = self.end_guarded(at, &[(x, zero)])[0];
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -3201,8 +3267,10 @@ impl<'a> Lower<'a> {
             }
             let at = self.begin_guarded(guard);
             for (off, x) in stores {
-                let p = dword(self, off);
+                let (p, valid) = dword(self, off);
+                let write = self.begin_guarded(valid);
                 self.s.m.store(self.cur, p, x);
+                self.end_guarded(write, &[]);
             }
             self.end_guarded(at, &[]);
             return Ok(());
@@ -3237,8 +3305,9 @@ impl<'a> Lower<'a> {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let p = dword(self, offset);
+        let (p, valid) = dword(self, offset);
         let at = self.begin_guarded(guard);
+        let in_bounds = self.begin_guarded(valid);
         let r = match rmw {
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
@@ -3247,6 +3316,8 @@ impl<'a> Lower<'a> {
                 .m
                 .cmpxchg(self.cur, p, v0, v1.ok_or("an LDS compare")?),
         };
+        let zero = self.s.m.i32(0);
+        let r = self.end_guarded(in_bounds, &[(r, zero)])[0];
         let r = self.end_guarded(at, &[(r, outside)])[0];
         if let Some(reg) = dst_reg {
             self.write(inst, Reg::V(reg), r, None);
@@ -3288,6 +3359,13 @@ impl<'a> Lower<'a> {
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
+            Fields::Sopp { .. } if name == "s_barrier"
+                && self.x.options.wave64 == Wave64Mode::Emulate
+                && self.s.threads.is_some() && self.s.mesh.is_none()
+                && (self.guard_depth != 0 || !self.uniform.get(b).copied().unwrap_or(false)) =>
+            {
+                Err("a thread-group barrier in divergent emulated control flow")
+            }
             Fields::Sopp { .. } if name == "s_barrier" => {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
@@ -5110,6 +5188,13 @@ impl<'a> Lower<'a> {
             }
             "v_writelane_b32" => {
                 // The lane given takes the scalar; the others keep their value.
+                let width = self.wave();
+                let tail = self.total_threads % width;
+                if self.wave64 == Wave64Mode::Emulate && tail != 0
+                    && v.src.get(1).and_then(operand_const_lane)
+                        .is_none_or(|k| (k & (width - 1)) >= tail) {
+                    return Err("a write to a potentially absent lane of a partial guest wave");
+                }
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a lane write");
@@ -5120,6 +5205,8 @@ impl<'a> Lower<'a> {
                 };
                 self.cross_lane(false)?;
                 let me = self.lane_index();
+                let mask = self.s.m.i32(self.wave() - 1);
+                let lane = self.s.m.bin(c, Bin::And, lane, mask);
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
@@ -7529,7 +7616,13 @@ impl<'a> Lower<'a> {
             return Err("a 16-bit output the stage data does not mark");
         }
         // A mesh lane writes its own vertex or primitive, where it exports.
-        let at = if mesh {
+        let at = if let Some(mesh) = self.s.mesh {
+            let (vertices, primitives) = mesh.output_counts(self.s.threads.expect("mesh")[0]);
+            let limit = if primitive { primitives } else { vertices };
+            if limit == 0 {
+                return Ok(());
+            }
+            let guard = self.mesh_output_guard(guard, limit);
             self.begin_guarded(guard)
         } else {
             None
@@ -7590,25 +7683,42 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Mesh: `exp prim` as the lane's primitive. Bit 31 culls it (all
-    /// indices 0: no area).
+    /// Mesh: bit 31 or an index outside the emitted vertices culls the triangle.
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
+        let mesh = self.s.mesh.expect("mesh");
+        let (vertices, primitives) = mesh.output_counts(self.s.threads.expect("mesh")[0]);
+        if primitives == 0 {
+            return Ok(());
+        }
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
+        let guard = self.mesh_output_guard(guard, primitives);
         let at = self.begin_guarded(guard);
-        let c = self.cur;
+        let block = self.cur;
         let z = self.s.m.i32(0);
-        let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
-        for k in 0..3 {
-            let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
-            let i = self.s.m.bin(c, Bin::LShr, x, shift);
-            let i = self.s.m.bin(c, Bin::And, i, mask);
-            args.push(self.s.m.select(c, culled, z, i));
-        }
+        let mask = self.s.m.i32(0x3FF);
+        let indices = [0, 10, 20].map(|shift| {
+            let shift = self.s.m.i32(shift);
+            let i = self.s.m.bin(block, Bin::LShr, x, shift);
+            self.s.m.bin(block, Bin::And, i, mask)
+        });
+        let culled = if let Some(bits) = triangle_cull_mask(vertices) {
+            let mask = self.s.m.i32(bits);
+            let flags = self.s.m.bin(block, Bin::And, x, mask);
+            self.s.m.cmp(block, pred::NE, flags, z)
+        } else {
+            let limit = self.s.m.i32(vertices);
+            let flag = self.s.m.cmp(block, pred::SLT, x, z);
+            indices.iter().fold(flag, |bad, &i| {
+                let outside = self.s.m.cmp(block, pred::IUGE, i, limit);
+                self.s.m.bin(block, Bin::Or, bad, outside)
+            })
+        };
+        let [a, b, c] = indices.map(|i| self.s.m.select(block, culled, z, i));
+        let args = [self.mesh_thread(), a, b, c];
         let void = self.s.t.void;
         self.s
-            .op(c, "emitIndices", Attr::NoUnwind, void, 169, &args);
+            .op(block, "emitIndices", Attr::NoUnwind, void, 169, &args);
         self.end_guarded(at, &[]);
         Ok(())
     }
@@ -7875,6 +7985,31 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn mesh_output_counts_and_packed_triangle_bounds() {
+        use super::super::shader::Mesh;
+        let mesh = Mesh {
+            max_vertices: 8,
+            max_primitives: 16,
+            topology: 2,
+        };
+        assert_eq!(mesh.output_counts(16), (8, 16));
+        assert_eq!(mesh.output_counts(4), (4, 4));
+        let empty = Mesh { max_vertices: 0, ..mesh };
+        assert_eq!(empty.output_counts(4), (0, 0));
+        assert_eq!(super::triangle_cull_mask(3), None);
+        for vertices in [1, 4, 8, 128, 256] {
+            let mask = super::triangle_cull_mask(vertices).unwrap();
+            for shift in [0, 10, 20] {
+                for index in 0..1024 {
+                    assert_eq!((index << shift) & mask != 0, index >= vertices);
+                }
+            }
+            assert_ne!((1 << 31) & mask, 0);
+            assert_eq!((1 << 30) & mask, 0);
+        }
+    }
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {

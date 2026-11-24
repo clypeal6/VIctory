@@ -1467,3 +1467,62 @@ mod tests {
         }
     }
 }
+
+/// Times WARP compiling a title shader's translation (WARP compiles on first
+/// use, inside the dispatch): `VICTORY_JIT_CONTAINER=<dumped .container>
+/// [VICTORY_JIT_MODE=native|wave32|emulate] cargo test --release -p
+/// victory-shader warp_jit_time -- --ignored --nocapture`; with `--features
+/// diagnostics` and `VICTORY_SHADER_LOOP_LIMIT=0xffffffff`, loops uncounted
+/// (WARP compiles Grand Theft Auto VI's 42683eebec081520 in 20 ms so, not in
+/// minutes with the counters). Bindings are dummies:
+/// only the compile time is measured.
+#[cfg(test)]
+#[test]
+#[ignore]
+fn warp_jit_time() {
+    let path = std::env::var("VICTORY_JIT_CONTAINER").expect("VICTORY_JIT_CONTAINER");
+    let container = std::fs::read(&path).expect("container");
+    let host = Host::new(true).expect("WARP");
+    // As the game on WARP (`victory-gpu`'s host).
+    if std::env::var_os("VICTORY_JIT_HARDWARE_RULES").is_none() {
+        super::set_software_host();
+    }
+    let wave64 = match std::env::var("VICTORY_JIT_MODE").as_deref() {
+        Ok("native") => Wave64Mode::Native,
+        Ok("wave32") => Wave64Mode::Wave32,
+        Ok("emulate") => Wave64Mode::Emulate,
+        _ => host.recommended_wave64_mode(),
+    };
+    let started = std::time::Instant::now();
+    let cs = match super::translate_with(&container, super::TranslateOptions { wave64 }) {
+        Ok(cs) => cs,
+        Err(e) => return println!("does not translate: {e}"),
+    };
+    println!("{wave64:?}: translated in {:?}, {} bytes of DXIL", started.elapsed(), cs.dxil.len());
+    let out = if cs.stage == crate::HwStage::Ps {
+        // A pixel program: drawn behind a stub vertex program.
+        let vs = stub_vs(&cs).expect("stub vertex program");
+        let (root, pso) = host.pipeline(&vs, &cs).expect("pipeline");
+        println!("pipeline made at {:?}", started.elapsed());
+        let roots = vec![(0, Root::Constants(vec![0; cs.user_data_dwords() as usize]))];
+        let d = Draw { roots, textures: &[], samplers: &[], vertices: &[], stride: 0, size: (4, 4), mesh_groups: 0 };
+        host.draw(&root, &pso, &d).map(|_| ())
+    } else if cs.stage == crate::HwStage::Ms {
+        // A mesh program: one group, behind a pixel program reading nothing.
+        let (root, pso) = host.mesh_pipeline(&cs, &stub_ps()).expect("pipeline");
+        println!("pipeline made at {:?}", started.elapsed());
+        let roots = vec![(0, Root::Constants(vec![0; cs.user_data_dwords() as usize]))];
+        let d = Draw { roots, textures: &[], samplers: &[], vertices: &[], stride: 0, size: (4, 4), mesh_groups: 1 };
+        host.draw(&root, &pso, &d).map(|_| ())
+    } else if cs.stage == crate::HwStage::Cs {
+        let (root, pso) = host.compute_pipeline(&cs).expect("pipeline");
+        println!("pipeline made at {:?}", started.elapsed());
+        let roots = vec![(0, Root::Constants(vec![0; cs.user_data_dwords() as usize]))];
+        host.dispatch(&root, &pso, &Dispatch { roots, views: &[View::RawUav(64)], samplers: &[], groups: [1, 1, 1] })
+            .map(|_| ())
+    } else {
+        println!("{:?}: translated only", cs.stage);
+        return;
+    };
+    println!("ran (WARP compiled) at {:?}: {}", started.elapsed(), out.map_or_else(|e| e, |_| "ok".into()));
+}

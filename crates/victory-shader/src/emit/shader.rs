@@ -45,6 +45,19 @@ pub(crate) struct Mesh {
     pub topology: u8,
 }
 
+impl Mesh {
+    /// Each console lane exports only its own vertex and primitive slot.
+    pub fn output_counts(self, threads: u32) -> (u32, u32) {
+        let vertices = self.max_vertices.min(threads);
+        let primitives = if vertices == 0 {
+            0
+        } else {
+            self.max_primitives.min(threads)
+        };
+        (vertices, primitives)
+    }
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,

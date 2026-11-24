@@ -108,6 +108,8 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let done = translate(&self.container);
+                #[cfg(feature = "diagnostics")]
+                self.dump(done.as_ref().ok());
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
@@ -127,6 +129,35 @@ impl Shader {
             })
             .as_ref()
     }
+
+    /// With `VICTORY_SHADER_DUMP=<hash>,...` and `VICTORY_CAPTURE=<folder>`
+    /// (diagnostics): the container the title passed and our DXIL for each
+    /// listed shader, as `<hash>.container` and `<hash>.dxil`, for offline
+    /// disassembly (`victory shader-info --disasm`).
+    #[cfg(feature = "diagnostics")]
+    fn dump(&self, translated: Option<&Translated>) {
+        let Ok(list) = std::env::var("VICTORY_SHADER_DUMP") else {
+            return;
+        };
+        if !list.split(',').any(|h| h.trim() == self.hash) {
+            return;
+        }
+        let Some(folder) = crate::capture::folder() else {
+            tracing::warn!(hash = %self.hash, "VICTORY_SHADER_DUMP needs VICTORY_CAPTURE");
+            return;
+        };
+        let mut files = vec![("container", self.container.as_slice())];
+        if let Some(t) = translated {
+            files.push(("dxil", t.host.dxil.as_slice()));
+        }
+        for (ext, bytes) in files {
+            let path = folder.join(format!("{}.{ext}", self.hash));
+            match std::fs::write(&path, bytes) {
+                Ok(()) => tracing::info!(path = %path.display(), "shader dumped"),
+                Err(e) => tracing::warn!(error = %e, path = %path.display(), "shader not dumped"),
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -134,7 +165,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     let host = crate::shader_cache::host_shader(container)?;
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL) {
+    let mut used = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data)
             .map_err(|e| e.to_string())?
             .into_iter()
@@ -148,6 +179,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
             .unwrap_or_default(),
         None => Vec::new(),
     };
+    // The console metadata can include a table the translated shader never indexes.
+    used.retain(|u| {
+        u.root != victory_shader::RootType::Table
+            || host.user_data.iter().any(|d| d.root == u.root && d.slot == u.slot)
+    });
     Ok(Translated { host, used })
 }
 

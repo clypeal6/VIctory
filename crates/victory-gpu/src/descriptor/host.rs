@@ -392,6 +392,16 @@ impl HostHeap {
         if let Some((address, len)) = buffer_range(&view) {
             let host = crate::shadow::find(address, len.max(1)).map(|s| s.gpu(address));
             text.push_str(&format!(" title {address:#x}+{len:#x} host {host:#x?}"));
+            // The first words in title memory and in the host copy the GPU reads.
+            #[cfg(feature = "diagnostics")]
+            if let Some(s) = crate::shadow::find(address, len.max(1)) {
+                let n = (len / 4).min(4) as usize;
+                // SAFETY: inside a buffer the title placed (GPU addresses are CPU addresses).
+                let words: Vec<u32> = (0..n)
+                    .map(|i| unsafe { (address as *const u32).add(i).read_unaligned() })
+                    .collect();
+                text.push_str(&format!(" words {words:?} host words {:?}", s.host_words(address, n)));
+            }
         }
         Some(text)
     }

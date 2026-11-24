@@ -317,6 +317,35 @@ fn divergent_cross_half_ballot_is_rejected_instead_of_hanging() {
 }
 
 #[test]
+fn emulation_rejects_a_divergent_explicit_group_barrier() {
+    let code = [
+        v_cmp_gt_u32(inline_u(32), 0),
+        s_and_saveexec_b64(6, VCC),
+        s_cbranch_execz(1),
+        sopp(0x0A, 0), // s_barrier
+        s_or_b64(EXEC_LO, EXEC_LO, 6),
+        S_ENDPGM,
+    ];
+    let prog = make_cs_program(&code, [128, 1, 1], 0, false);
+    let err = emit_cs(&prog, Wave64Mode::Emulate).unwrap_err();
+    assert!(matches!(
+        err,
+        ShaderError::Unsupported { what, .. } if what.contains("barrier") && what.contains("divergent")
+    ), "{err:?}");
+}
+
+#[test]
+fn guest_lds_access_limit_excludes_the_emulators_scratch() {
+    use super::lower::last_lds_base;
+    assert_eq!(last_lds_base(128, 0), Some(508));
+    assert_eq!(last_lds_base(128, 4), Some(504));
+    assert_eq!(last_lds_base(128, 508), Some(0));
+    assert_eq!(last_lds_base(128, 512), None);
+    assert_eq!(last_lds_base(0, 0), None);
+    assert_eq!(last_lds_base(128, u32::MAX), None);
+}
+
+#[test]
 fn divergent_early_return_taints_subsequent_blocks() {
     // if (v0 < 32) return; // after_ret is non-uniform across the group!
     // bcnt1 in after_ret must fail instead of inserting a hanging barrier.
@@ -524,6 +553,51 @@ mod gpu {
                 }
             }
         });
+    }
+
+    #[test]
+    fn warp_guest_wave32_keeps_ballots_and_shuffles_inside_each_wave() {
+        // Two complete guest waves and an eight-lane tail. XOR 7 stays in each live group.
+        let threads = 72;
+        let mut code = vec![
+            v_cmp_lt_u32(inline_u(14), 0),
+            sop1(4, 0x0F, VCC), // s_bcnt1_i32_b32: count thread IDs greater than 14
+            sop2(4, 0x1E, 4, inline_u(8)), // s_lshl_b32
+        ];
+        code.extend_from_slice(&ds_op(0x35, 0x1F, 0x1C, 0, 0, 2)); // ds_swizzle_b32: XOR 7
+        code.extend_from_slice(&v_readlane_b32(5, 0, inline_u(32))); // lane 32 aliases lane 0 in wave32
+        code.push(sop2(5, 0x1E, 5, inline_u(16)));
+        code.extend_from_slice(&v_mbcnt_lo_u32_b32(3, NEG_ONE, inline_u(0)));
+        code.push(v_lshlrev_b32(3, inline_u(24), 3));
+        code.push(v_or_b32(1, 4, 2));
+        code.push(v_or_b32(1, 5, 1));
+        code.push(v_or_b32(1, vgpr(3), 1));
+        // Store and read positions 224..508, including the final legal guest dword.
+        code.push(s_mov_b32(4, LIT));
+        code.push(224);
+        code.push(v_lshlrev_b32(6, inline_u(2), 0));
+        code.push(v_add_nc_u32(6, 4, 6));
+        code.extend_from_slice(&ds_op(0x0D, 0, 0, 6, 1, 0));
+        code.push(sopp(0x0A, 0));
+        code.extend_from_slice(&ds_op(0x36, 0, 0, 6, 0, 2));
+        emit_uav_store(&mut code, 2, 0);
+        code.push(S_ENDPGM);
+
+        let mut prog = make_cs_program(&code, [threads, 1, 1], 512, false);
+        prog.wave64 = false;
+        let shader = emit_cs(&prog, Wave64Mode::Emulate).unwrap();
+        assert_eq!(psv_wave_range(&shader), (0, u32::MAX));
+        let host = Host::new(true).expect("WARP");
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: Vec::new(), views: &[View::RawUav(threads)], samplers: &[], groups: [1, 1, 1],
+        }).unwrap();
+        for tid in 0..threads {
+            let first = tid / 32 * 32;
+            let count = (first..(first + 32).min(threads)).filter(|&t| t > 14).count() as u32;
+            let expected = (tid ^ 7) | (count << 8) | (first << 16) | ((tid - first) << 24);
+            assert_eq!(out[0][tid as usize], expected, "thread {tid}");
+        }
     }
 
     #[test]

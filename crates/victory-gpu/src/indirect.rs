@@ -39,32 +39,50 @@ void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= records) return;
     uint at = id.x * stride;
     uint cost;
+    // For reports (`BudgetWords`): the largest value read, and whether a
+    // bound changed the record.
+    uint largest;
+    bool clamped;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
-        uint count = min(args.Load(at), 1u << 24);
-        uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
+        uint2 raw = args.Load2(at);
+        uint count = min(raw.x, 1u << 24);
+        uint instances = min(raw.y, (1u << 26) / max(count, 1u));
         cost = count * instances;
+        largest = max(raw.x, raw.y);
+        clamped = count != raw.x || instances != raw.y;
         args.Store2(at, uint2(count, instances));
     } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
+        uint3 raw = args.Load3(at);
+        uint3 g = min(raw, uint3(65535, 65535, 65535));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64;
+        largest = max(raw.x, max(raw.y, raw.z));
+        clamped = any(g != raw);
         args.Store3(at, g);
     } else {
         // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = args.Load3(at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        uint3 raw = args.Load3(at);
+        uint3 g = uint3(min(raw.x, 65535u), min(raw.y, 1u), min(raw.z, 1u));
         cost = g.x * g.y * g.z * 128;
+        largest = max(raw.x, max(raw.y, raw.z));
+        clamped = any(g != raw);
         args.Store3(at, g);
     }
+    budget.InterlockedAdd(4, 1);
+    if (clamped) {
+        budget.InterlockedAdd(8, 1);
+    }
+    budget.InterlockedMax(12, largest);
     uint before;
     budget.InterlockedAdd(0, cost, before);
     if (before >= BUDGET || before + cost > BUDGET) {
         // Draws keep their layout with no vertices; groups become zero.
         args.Store(at, 0);
+        budget.InterlockedAdd(16, 1);
     }
 }
 "#;

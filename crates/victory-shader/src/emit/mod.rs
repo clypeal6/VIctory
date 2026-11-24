@@ -122,6 +122,24 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+static SOFTWARE_HOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The host is the software adapter (WARP): from now on, compute programs
+/// that synchronize their group keep their loops uncounted. WARP's compute
+/// transformer grinds for ~40 s over a loop-limit exit in such a program and
+/// then crashes (`ConstructLoadStoreSets`; Grand Theft Auto VI's
+/// 42683eebec081520 at mission start), and a lane leaving before its group's
+/// barrier is undefined anyway. Call before translating; part of the
+/// translation, so caches must key on [`software_host`].
+pub fn set_software_host() {
+    SOFTWARE_HOST.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_software_host`] was called.
+pub fn software_host() -> bool {
+    SOFTWARE_HOST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
@@ -193,7 +211,7 @@ pub enum Wave64Mode {
     Native,
     /// Map virtual 64-lane waves onto 32-lane host waves (`WaveSize(32)`).
     Wave32,
-    /// Emulate 64-lane waves in group-shared memory without `WaveSize`.
+    /// Emulate the guest wave width in group-shared memory without `WaveSize`.
     Emulate,
 }
 
@@ -727,6 +745,65 @@ mod tests {
         assert_eq!(center[4 + 1], 0, "center interpolation is per pixel");
         let sample = psv_of(1 << 0);
         assert_eq!(sample[4 + 1], 1, "PSInfo.SampleFrequency");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bounded_mesh_exports_validate() {
+        let path = validator::Validator::default_path();
+        let Ok(mut validator) = validator::Validator::load(path.as_deref()) else {
+            eprintln!("no dxil.dll; skipped");
+            return;
+        };
+        let position = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 4,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let sig = container::signature(&[position], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &sig)]);
+        let container = Container::parse(&bytes).unwrap();
+        // One degenerate triangle with an initialized vertex at (0, 0, 0, 1).
+        let words = [
+            0x7E00_0280u32, 0x7E02_02F2, // v0 = 0; v1 = 1.0
+            0xD765_0002, 0x0001_00C1,     // v_mbcnt_lo_u32_b32 v2, -1, 0
+            0x7DA4_0480,                  // v_cmpx_eq_u32 exec, 0, v2
+            0xF800_00CF, 0x0100_0000,     // exp pos0, v0, v0, v0, v1
+            0xF800_0941, 0x0000_0000,     // exp prim, v0, off, off, off done
+            0xBF81_0000,                  // s_endpgm
+        ];
+        for (max_vertices, max_primitives) in [(3, 1), (32, 64)] {
+            let native = NativeProgram {
+                stage: HwStage::Ms,
+                wave64: false,
+                vgprs: 3,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ms(crate::native::MeshIo {
+                    outputs: vec![],
+                    clip_cntl: 0,
+                    threads: 32,
+                    max_vertices,
+                    max_primitives,
+                    topology: 2,
+                    lds_bytes: 0,
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage).unwrap();
+            let mut shader = emit(&container, &native, &p, &st, &io, &res).unwrap();
+            validator.validate(&mut shader.dxil).unwrap();
+        }
     }
 
     /// A pixel shader reading channel z of an input whose element starts at

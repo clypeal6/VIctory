@@ -13,7 +13,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
@@ -179,6 +179,7 @@ fn create() -> windows::core::Result<Host> {
         if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            victory_shader::emit::set_software_host();
             tracing::info!("host device on the software adapter (WARP)");
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
@@ -337,7 +338,14 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With `VICTORY_D3D12_DRED`: where the GPU writes how far the list got
+    /// (`HostList::progress`), and the buffer's mapping.
+    #[cfg(feature = "diagnostics")]
+    progress: OnceLock<Option<(ID3D12Resource, usize)>>,
 }
+
+/// Words of a list's indirect-work budget the clamp writes (`indirect`).
+const BUDGET_WORDS: usize = 5;
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
@@ -439,6 +447,9 @@ struct Deferred {
     writes: Vec<(usize, crate::queue::Written, usize)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Whether a step zeroes the progress words (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    progress_zeroed: bool,
 }
 
 impl Host {
@@ -513,6 +524,8 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                progress: OnceLock::new(),
             })
         }
     }
@@ -564,7 +577,8 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                        let running = if groups.len() > 1 { &runs[i..=i] } else { runs };
+                        wait_reporting(self.event, running);
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
@@ -591,10 +605,17 @@ impl Host {
                 .iter()
                 .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
                 .collect();
-            tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
+            let budgets: Vec<(usize, [u32; BUDGET_WORDS])> = runs
+                .iter()
+                .enumerate()
+                .filter_map(|(i, l)| Some((i, l.budget_words()?)))
+                .collect();
+            tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?budgets, ?pipelines, "slow host submission");
         }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            #[cfg(feature = "diagnostics")]
+            report_progress(runs, true);
             fail(format_args!(
                 "host GPU device removed after a submission of {} lists{}{}",
                 runs.len(),
@@ -1014,6 +1035,7 @@ impl HostList {
                 // SAFETY: an open list and our query heap.
                 unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
             }
+            self.mark_progress(at);
             let what = what();
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
@@ -1025,6 +1047,67 @@ impl HostList {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push((what, range));
+        }
+    }
+
+    /// Records, before noted command `at`, GPU writes of `at + 1`: to word
+    /// 0 once every earlier command has started, to word 1 once every
+    /// earlier command has completed (diagnostics, with device-removed data
+    /// on). A submission that does not finish can then name the command
+    /// the GPU is in (`HostList::progress`), which breadcrumbs only do
+    /// after a device removal the software adapter never makes.
+    #[cfg(feature = "diagnostics")]
+    fn mark_progress(&self, at: u32) {
+        let Some((buffer, data)) = self
+            .progress
+            .get_or_init(|| {
+                let (b, d) = host()?.shared_buffer(256)?;
+                Some((b, d as usize))
+            })
+            .as_ref()
+        else {
+            return;
+        };
+        let mut deferred = self.deferred();
+        if !deferred.progress_zeroed {
+            deferred.progress_zeroed = true;
+            let words = *data;
+            // SAFETY: the list's own mapped words, written before it runs.
+            deferred.copies.push(Step::Host(Box::new(move || unsafe {
+                (words as *mut u32).write_volatile(0);
+                (words as *mut u32).add(1).write_volatile(0);
+            })));
+        }
+        drop(deferred);
+        let Ok(list) = self.list.cast::<ID3D12GraphicsCommandList2>() else {
+            return;
+        };
+        // SAFETY: a live buffer of ours.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let params = [
+            D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu, Value: at + 1 },
+            D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu + 4, Value: at + 1 },
+        ];
+        let modes = [
+            D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN,
+            D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT,
+        ];
+        // SAFETY: an open list; both writes land in our buffer.
+        unsafe { list.WriteBufferImmediate(2, params.as_ptr(), Some(modes.as_ptr())) };
+    }
+
+    /// How far the list got as the GPU last wrote it: (commands started,
+    /// commands completed), counted in noted commands (diagnostics). Read
+    /// while the list may still run.
+    #[cfg(feature = "diagnostics")]
+    fn progress(&self) -> Option<(u32, u32)> {
+        let (_, data) = self.progress.get()?.as_ref()?;
+        // SAFETY: the list's own persistently mapped buffer (256 bytes).
+        unsafe {
+            Some((
+                (*data as *const u32).read_volatile(),
+                (*data as *const u32).add(1).read_volatile(),
+            ))
         }
     }
 
@@ -1149,13 +1232,29 @@ impl HostList {
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
             let at = *data;
-            // SAFETY: the list's own mapped word, written before it runs.
-            deferred
-                .copies
-                .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
+            // SAFETY: the list's own mapped words, written before it runs.
+            deferred.copies.push(Step::Host(Box::new(move || unsafe {
+                for i in 0..BUDGET_WORDS {
+                    (at as *mut u32).add(i).write_volatile(0);
+                }
+            })));
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// The indirect-work budget's words as the clamp last left them (work
+    /// so far, records, records a bound changed, the largest value read,
+    /// records run empty), if the list used it since it was made. Read
+    /// while the list may still run: a report, not a synchronised value.
+    pub(crate) fn budget_words(&self) -> Option<[u32; BUDGET_WORDS]> {
+        let (_, data) = self.budget.get()?.as_ref()?;
+        let mut words = [0; BUDGET_WORDS];
+        for (i, w) in words.iter_mut().enumerate() {
+            // SAFETY: the list's own persistently mapped buffer (256 bytes).
+            *w = unsafe { (*data as *const u32).add(i).read_volatile() };
+        }
+        Some(words)
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -1838,6 +1937,85 @@ impl Host {
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
+            }
+        }
+    }
+}
+
+/// Waits for a submission's event. A submission still running after 5 s is
+/// reported then and every 5 s after, with what its lists bind: the
+/// software adapter never resets a device, and a title's own watchdog may
+/// end the process before a slow submission returns to be reported.
+fn wait_reporting(event: HANDLE, runs: &[&HostList]) {
+    const EVERY_MS: u32 = 5_000;
+    let started = std::time::Instant::now();
+    let mut reports = 0u32;
+    // SAFETY: our event, live while the host is.
+    while unsafe { WaitForSingleObject(event, EVERY_MS) }
+        == windows::Win32::Foundation::WAIT_TIMEOUT
+    {
+        reports += 1;
+        let pipelines: std::collections::BTreeSet<String> = runs
+            .iter()
+            .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .collect();
+        // Per list using indirect execution: [work, records, clamped,
+        // largest value, run empty] (see `HostList::budget_words`).
+        let budgets: Vec<(usize, [u32; BUDGET_WORDS])> = runs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| Some((i, l.budget_words()?)))
+            .collect();
+        tracing::warn!(
+            s = started.elapsed().as_secs(),
+            lists = runs.len(),
+            ?budgets,
+            ?pipelines,
+            "host submission still running"
+        );
+        #[cfg(feature = "diagnostics")]
+        report_progress(runs, reports == 1);
+    }
+    let _ = reports;
+}
+
+/// Where each list is by its GPU progress markers, and with `detail` the
+/// commands around there and what their buffers hold now (diagnostics, with
+/// `VICTORY_D3D12_DRED`): the first command not completed is
+/// `completed - 1`, the last one started at most `started - 1`.
+#[cfg(feature = "diagnostics")]
+fn report_progress(runs: &[&HostList], detail: bool) {
+    for (i, r) in runs.iter().enumerate() {
+        let Some((started, completed)) = r.progress() else {
+            continue;
+        };
+        let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
+        tracing::warn!(list = i, commands = notes.len(), started, completed, "still running: progress");
+        if !detail {
+            continue;
+        }
+        let from = completed.saturating_sub(3) as usize;
+        let to = (started as usize + 3).min(notes.len());
+        for (n, (text, _)) in notes.iter().enumerate().take(to).skip(from) {
+            let text: String = text.chars().take(4000).collect();
+            tracing::warn!("still running: list {i}, command {n} of {}: {text}", notes.len());
+            // Now, after this submission's refreshes: what the GPU reads.
+            for part in text.split(" title 0x").skip(1) {
+                let Some((at, rest)) = part.split_once("+0x") else { continue };
+                let len = rest.split(|c: char| !c.is_ascii_hexdigit()).next().unwrap_or("");
+                let (Ok(at), Ok(len)) = (u64::from_str_radix(at, 16), u64::from_str_radix(len, 16)) else {
+                    continue;
+                };
+                if let Some(s) = crate::shadow::find(at, len.max(1)) {
+                    let words = (len / 4).min(4) as usize;
+                    // SAFETY: title memory the view names.
+                    let title: Vec<u32> =
+                        (0..words).map(|k| unsafe { (at as *const u32).add(k).read_unaligned() }).collect();
+                    tracing::warn!(
+                        "still running: list {i}, command {n} reads {at:#x}: title {title:?} host now {:?}",
+                        s.host_words(at, words)
+                    );
+                }
             }
         }
     }

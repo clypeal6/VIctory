@@ -89,6 +89,17 @@ impl Shadow {
         self.gpu + (address - self.start)
     }
 
+    /// Up to `n` words of the copy at a title address, as the GPU reads them
+    /// (diagnostics; racy while a submission runs).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn host_words(&self, address: u64, n: usize) -> Vec<u32> {
+        let n = n.min((self.left(address) / 4) as usize);
+        // SAFETY: inside the copy's persistent mapping.
+        (0..n)
+            .map(|i| unsafe { self.data.add((address - self.start) as usize).cast::<u32>().add(i).read_unaligned() })
+            .collect()
+    }
+
     /// Bytes from a title address to the buffer's end.
     pub(crate) fn left(&self, address: u64) -> u64 {
         (self.start + self.len).saturating_sub(address)
