@@ -924,6 +924,36 @@ mod gpu {
     }
 
     #[test]
+    fn gpu_64_threads_divergent_loop_leaves_on_a_lane_mask() {
+        // The console compiler's divergent loop (GTA VI compute 42683eebec081520):
+        // lanes still looping in s[10:11]; each pass `v_cmpx` leaves EXEC = the
+        // lanes done, `s_andn2_b64` drops them, and SCC (any left) loops back.
+        let mut code = vec![
+            v_mov_b32(1, inline_u(0)),               // passes
+            v_mov_b32(2, inline_u(0)),               // counter
+            v_and_b32(3, inline_u(3), 0),            // last pass index = tid & 3
+            s_mov_b64(10, EXEC_LO),                  // looping lanes
+            s_mov_b64(8, EXEC_LO),                   // EXEC before the loop
+            sopp(0x02, 1),                           // s_branch body
+            sop2(EXEC_LO, 0x0F, 4, 10),              // latch: s_and_b64 exec, s[4:5], s[10:11]
+            v_add_nc_u32(1, inline_u(1), 1),         // body
+            v_add_nc_u32(2, inline_u(1), 2),
+            s_mov_b64(4, EXEC_LO),
+            vopc(0xD4, vgpr(2), 3),                  // v_cmpx_gt_u32 exec, v2, v3: lanes done
+            sop2(10, 0x15, 10, EXEC_LO),             // s_andn2_b64 s[10:11], s[10:11], exec
+        ];
+        let br = code.len();
+        code.push(s_cbranch_scc1((6 - (br as isize + 1)) as i16)); // to the latch
+        code.push(s_mov_b64(EXEC_LO, 8));
+        emit_uav_store(&mut code, 1, 0);
+        code.push(S_ENDPGM);
+
+        let prog = make_cs_program(&code, [64, 1, 1], 0, false);
+        let expected: Vec<u32> = (0..64u32).map(|i| (i & 3) + 1).collect();
+        run_on_hosts("divergent_loop_lane_mask", &prog, [1, 1, 1], 64, &expected, false);
+    }
+
+    #[test]
     fn gpu_32_threads_wave32_fast_path_with_high_lane_spill() {
         // 32-thread Wave64 compute shader: Wave32 uses single wave + zero LDS scratch,
         // while still resolving constant-lane SGPR spill at lane 45 (>= 32).

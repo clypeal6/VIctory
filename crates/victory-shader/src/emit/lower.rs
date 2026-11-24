@@ -3970,20 +3970,32 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        if let Some(used) = kind.filter(|u| u.kind == ResourceType::Srv) {
+            // The title makes a structured view of a structured buffer, and a
+            // raw read of one is undefined: NVIDIA reads past its first dwords
+            // as zeros (GTA VI's 42683eebec081520 then divides by zero and
+            // loops four billion times). So read it as structured.
+            let stride = Some(used.stride).filter(|&s| s > 4 && s.is_multiple_of(4));
+            let h = self.handle(site, src, false, stride.map_or((11, 0), |s| (12, s)))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
                 let mask = self.s.m.i8(1);
                 let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+                let (index, within) = match stride {
+                    Some(s) => {
+                        let s = self.s.m.i32(s);
+                        (self.s.m.bin(c, Bin::UDiv, a, s), self.s.m.bin(c, Bin::URem, a, s))
+                    }
+                    None => (a, u),
+                };
                 let r = self.s.op(
                     c,
                     "rawBufferLoad.f32",
                     Attr::ReadOnly,
                     self.s.t.res_ret,
                     139,
-                    &[h, a, u, mask, al],
+                    &[h, index, within, mask, al],
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
