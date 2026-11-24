@@ -166,6 +166,11 @@ fn lower_cs(words: &[u32]) -> HostShader {
     shader
 }
 
+/// One GPU test at a time: with these tests on the hardware adapter and WARP
+/// from several test threads at once, now and then none of their dispatches
+/// ever completes and the test binary hangs.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
 fn run_cases(
@@ -173,10 +178,6 @@ fn run_cases(
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
-    // One test at a time: with these tests on the hardware adapter and WARP
-    // from several test threads at once, now and then none of their
-    // dispatches ever completes and the test binary hangs.
-    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
@@ -1067,8 +1068,7 @@ fn structured_buffer_flat_byte_offset_loads_reach_elements_past_the_first() {
 
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
-    let res =
-        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
         native: &native,
@@ -1080,6 +1080,7 @@ fn structured_buffer_flat_byte_offset_loads_reach_elements_past_the_first() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        options: super::TranslateOptions::default(),
     })
     .expect("lower");
 
@@ -1122,7 +1123,8 @@ fn structured_buffer_flat_byte_offset_loads_reach_elements_past_the_first() {
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Constants, 0) => byte_off,
                     (RootType::Table, 1) => 0,
-                    other => panic!("unexpected user data {other:?}"),
+                    (root, slot) => super::host::guard(root, views.len(), 0)
+                        .unwrap_or_else(|| panic!("unexpected user data {:?}", (root, slot))),
                 };
             }
             let out = host
